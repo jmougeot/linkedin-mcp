@@ -1,0 +1,15 @@
+{
+  "name": "linkedin-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Serveur MCP permettant à Claude d'envoyer des messages/invitations LinkedIn via une extension Chrome (session de l'utilisateur).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.24.0"
+  }
+}

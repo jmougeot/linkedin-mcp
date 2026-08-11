@@ -1,0 +1,30 @@
+# Déploiement sur le VPS partagé (aux côtés des stacks "ruby", sequence-mail et
+# azerit-app). On NE lance PAS de Caddy : le ruby-caddy existant détient déjà
+# 80/443 et route linkedin.azerit.tech vers ce conteneur PAR SON NOM, via le
+# réseau ruby_default.
+#
+#   docker compose -f docker-compose.server.yml up -d --build
+#
+services:
+  linkedin-mcp:
+    build: .
+    container_name: linkedin-mcp
+    restart: unless-stopped
+    env_file: .env              # LI_TOKEN (obligatoire) + quotas éventuels
+    environment:
+      - LI_TRANSPORT=http
+      - LI_MCP_PORT=3210
+      - LI_BIND=0.0.0.0
+    volumes:
+      - linkedin-mcp-data:/app/data   # compteurs journaliers persistés
+    networks:
+      - ruby_default
+    expose:
+      - "3210"                  # joignable seulement par ruby-caddy, pas publié
+
+volumes:
+  linkedin-mcp-data:
+
+networks:
+  ruby_default:
+    external: true              # réseau créé par la stack ruby existante

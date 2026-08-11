@@ -1,0 +1,11 @@
+# Contexte de build minimal : uniquement server.js + package*.json (via Dockerfile).
+node_modules/
+data/
+extension/
+.env
+.git/
+.gitignore
+.DS_Store
+**/.DS_Store
+*.md
+*.csv

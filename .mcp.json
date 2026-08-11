@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "linkedin": {
+      "command": "node",
+      "args": ["/Users/jacquesmougeot/Desktop/Azerit/Linkedin_mcp/server.js"]
+    }
+  }
+}

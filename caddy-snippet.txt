@@ -1,0 +1,11 @@
+# >>> Bloc à AJOUTER au Caddyfile de ruby-caddy (/opt/ruby/docker/Caddyfile).
+# HTTPS auto via Let's Encrypt dès que linkedin.azerit.tech pointe sur le serveur.
+# Recharger ensuite : docker exec ruby-caddy caddy reload --config /etc/caddy/Caddyfile
+#
+# NOTE : pas de gzip ici — le connecteur MCP répond en SSE (text/event-stream),
+# que la compression pourrait bufferiser. L'auth est gérée par l'app (jeton dans
+# l'URL /mcp/<LI_TOKEN> + Bearer sur /api/li/*), donc pas de basic_auth.
+linkedin.azerit.tech {
+	reverse_proxy linkedin-mcp:3210
+}
+# <<< fin du bloc
