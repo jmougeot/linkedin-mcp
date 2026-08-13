@@ -4,7 +4,8 @@
  *
  * Deux faces :
  *  1. MCP  : Claude appelle linkedin_send_message / _send_invitation /
- *            _read_messages / _list_conversations / _status / _cancel. Chaque
+ *            _read_messages / _list_conversations / _view_profile / _status /
+ *            _cancel. Chaque
  *            action est mise en FILE, jamais exécutée directement — c'est
  *            l'extension qui agit.
  *  2. HTTP : l'extension Chrome interroge ce serveur (long-poll) pour savoir si
@@ -43,8 +44,10 @@ const BIND = process.env.LI_BIND || "127.0.0.1"; // 0.0.0.0 si exposé sans reve
 const PORT = Number(process.env.LI_MCP_PORT || 3210);
 const CAP_INVITE = Number(process.env.LI_CAP_INVITE || 20);   // plafond/jour
 const CAP_MESSAGE = Number(process.env.LI_CAP_MESSAGE || 40); // plafond/jour
-const MIN_GAP_S = Number(process.env.LI_MIN_GAP_S || 45);     // délai mini entre 2 actions
+const MIN_GAP_S = Number(process.env.LI_MIN_GAP_S || 45);     // délai mini entre 2 envois
 const MAX_GAP_S = Number(process.env.LI_MAX_GAP_S || 120);    // délai maxi
+const READ_MIN_GAP_S = Number(process.env.LI_READ_MIN_GAP_S || 2); // délai mini entre 2 lectures
+const READ_MAX_GAP_S = Number(process.env.LI_READ_MAX_GAP_S || 6); // délai maxi
 const FAIL_PAUSE_MIN = Number(process.env.LI_FAIL_PAUSE_MIN || 10);       // pause après échec simple
 const CHECKPOINT_PAUSE_MIN = Number(process.env.LI_CHECKPOINT_PAUSE_MIN || 60); // pause après captcha/checkpoint
 const TOOL_WAIT_S = Number(process.env.LI_TOOL_WAIT_S || 90); // attente max du résultat côté outil MCP
@@ -127,11 +130,14 @@ function recordResult(action, ok, error, data) {
     saveState();
   }
   lastActionAt = Date.now();
-  nextGapMs = isSend ? rand(MIN_GAP_S, MAX_GAP_S) * 1000 : rand(5, 15) * 1000;
+  nextGapMs = isSend ? rand(MIN_GAP_S, MAX_GAP_S) * 1000 : rand(READ_MIN_GAP_S, READ_MAX_GAP_S) * 1000;
   if (!ok) {
     const critical = /checkpoint|captcha|challenge|contrôle de sécurité/i.test(error || "");
-    const pauseMin = critical ? CHECKPOINT_PAUSE_MIN : isSend ? FAIL_PAUSE_MIN : 1;
-    pausedUntil = Date.now() + pauseMin * 60_000;
+    // Page 404 (profil supprimé / URL erronée) : échec « normal », pas un signal
+    // de détection — aucune pause punitive, on passe à l'action suivante.
+    const notFound = /\(404\)/.test(error || "");
+    const pauseMin = critical ? CHECKPOINT_PAUSE_MIN : notFound ? 0 : isSend ? FAIL_PAUSE_MIN : 1;
+    if (pauseMin) pausedUntil = Date.now() + pauseMin * 60_000;
   }
   const r = {
     id: action.id, type: action.type, target: action.linkedin || action.thread || (action.open ? "conversation-ouverte" : action.conv_name) || null,
@@ -173,7 +179,7 @@ function enqueue(type, linkedinUrl, body, extra = {}) {
   }
   const action = {
     id: randomUUID(),
-    type, // "invite" | "message" | "read_messages" | "list_conversations"
+    type, // "invite" | "message" | "read_messages" | "list_conversations" | "view_profile"
     linkedin: linkedinUrl || null,
     body: body || "",
     ...extra,
@@ -409,12 +415,25 @@ const http = createServer((req, res) => {
 });
 
 let httpReady = false;
+let bindRetryTimer = null;
 http.on("error", (e) => {
+  if (e.code === "EADDRINUSE") {
+    // Port occupé (session précédente encore ouverte ?) : on réessaie en boucle
+    // pour récupérer le port dès qu'il se libère, sans redémarrer la session.
+    if (!bindRetryTimer) {
+      console.error(`[linkedin-mcp] port ${PORT} occupé (autre session ?) — nouvelle tentative toutes les 5 s`);
+      bindRetryTimer = setInterval(() => http.listen(PORT, BIND), 5_000);
+    }
+    return;
+  }
   console.error(`[linkedin-mcp] serveur HTTP indisponible sur le port ${PORT}: ${e.message}`);
-  console.error("[linkedin-mcp] (le port est peut-être déjà occupé — changez LI_MCP_PORT)");
 });
 http.listen(PORT, BIND, () => {
   httpReady = true;
+  if (bindRetryTimer) {
+    clearInterval(bindRetryTimer);
+    bindRetryTimer = null;
+  }
   console.error(`[linkedin-mcp] serveur HTTP prêt sur http://${BIND}:${PORT}`);
   if (TRANSPORT === "http") console.error(`[linkedin-mcp] endpoint MCP distant : ${MCP_PATH}`);
 });
@@ -423,7 +442,7 @@ http.listen(PORT, BIND, () => {
 function requireHttp() {
   if (!httpReady) {
     throw new Error(
-      `Le serveur HTTP local (port ${PORT}) n'a pas pu démarrer — probablement occupé par une autre session. Fermez l'autre session ou changez LI_MCP_PORT.`
+      `Le serveur HTTP local (port ${PORT}) n'a pas pu démarrer — probablement occupé par une autre session. Fermez l'autre session (le port sera repris automatiquement en ~5 s) ou changez LI_MCP_PORT.`
     );
   }
 }
@@ -477,6 +496,9 @@ function describeOutcome(action, result, verb) {
   if (result.ok) {
     const note = result.error ? ` (note : ${result.error})` : "";
     return text(`✅ ${verb} envoyé avec succès à ${dest}${note}. Quotas du jour : ${counters.invite}/${CAP_INVITE} invitations, ${counters.message}/${CAP_MESSAGE} messages.`);
+  }
+  if (/\(404\)/.test(result.error || "")) {
+    return text(`❌ ${verb} impossible : ${result.error}. Vérifiez l'URL — aucune pause de sécurité appliquée (page inexistante, pas un signal de détection).`);
   }
   return text(
     `❌ Échec de l'envoi vers ${dest} : ${result.error || "erreur inconnue"}. ` +
@@ -554,7 +576,11 @@ function describeReadOutcome(action, result, what) {
         ` Utilisez linkedin_status pour vérifier.`
     );
   }
-  if (result.ok) return text(JSON.stringify(result.data, null, 2));
+  // JSON compact (pas de pretty-print) : l'indentation coûtait ~30 % de tokens en plus.
+  if (result.ok) return text(JSON.stringify(result.data));
+  if (/\(404\)/.test(result.error || "")) {
+    return text(`❌ Lecture impossible (${what}) : ${result.error}. Vérifiez l'URL — aucune pause de sécurité appliquée.`);
+  }
   return text(`❌ Échec de la lecture (${what}) : ${result.error || "erreur inconnue"}.`);
 }
 
@@ -610,6 +636,29 @@ mcp.registerTool(
 );
 
 mcp.registerTool(
+  "linkedin_view_profile",
+  {
+    title: "Voir un profil LinkedIn",
+    description:
+      "Ouvre un profil LinkedIn (/in/...) via l'extension Chrome et extrait les informations visibles : " +
+      "nom, titre, localisation, niveau de relation, à propos, expériences, formation. " +
+      "Retourne un JSON { profile: {...} }. Lecture sans quota journalier (petit délai anti-détection).",
+    inputSchema: {
+      profile_url: z.string().url().describe("URL du profil LinkedIn, ex. https://www.linkedin.com/in/jean-dupont/"),
+    },
+  },
+  async ({ profile_url }) => {
+    requireHttp();
+    if (!/linkedin\.com\/in\//i.test(profile_url)) {
+      throw new Error("L'URL doit être un profil LinkedIn (https://www.linkedin.com/in/...).");
+    }
+    const action = enqueue("view_profile", profile_url, "");
+    const result = await waitForResult(action.id);
+    return describeReadOutcome(action, result, profile_url);
+  }
+);
+
+mcp.registerTool(
   "linkedin_status",
   {
     title: "État LinkedIn (extension, quotas, file)",
@@ -617,7 +666,7 @@ mcp.registerTool(
       "État du pont LinkedIn : extension Chrome connectée ou non, quotas du jour, actions en file, pause de sécurité éventuelle, et derniers résultats.",
     inputSchema: {},
   },
-  async () => text(JSON.stringify(statusSnapshot(), null, 2))
+  async () => text(JSON.stringify(statusSnapshot()))
 );
 
 mcp.registerTool(

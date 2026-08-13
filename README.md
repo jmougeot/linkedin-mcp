@@ -41,7 +41,8 @@ Le reste de ce README décrit le mode **local**. Pour Cowork, suivez
 
 Réglages via variables d'environnement (dans `.mcp.json`, champ `env`) :
 `LI_MCP_PORT`, `LI_CAP_INVITE`, `LI_CAP_MESSAGE`, `LI_MIN_GAP_S`, `LI_MAX_GAP_S`,
-`LI_FAIL_PAUSE_MIN`, `LI_CHECKPOINT_PAUSE_MIN`, `LI_TOOL_WAIT_S`.
+`LI_READ_MIN_GAP_S`, `LI_READ_MAX_GAP_S`, `LI_FAIL_PAUSE_MIN`,
+`LI_CHECKPOINT_PAUSE_MIN`, `LI_TOOL_WAIT_S`.
 **Les baisser est sûr ; les gonfler augmente le risque de restriction du compte.**
 
 ## Installation
@@ -78,6 +79,7 @@ Outils disponibles :
 | `linkedin_send_invitation` | Envoyer une invitation, note optionnelle (≤ 200 car.) |
 | `linkedin_read_messages` | Lire l'historique d'une conversation avec un profil (`/in/...`) |
 | `linkedin_list_conversations` | Lister les conversations récentes de la messagerie |
+| `linkedin_view_profile` | Voir un profil (`/in/...`) : nom, titre, à propos, expériences… |
 | `linkedin_status` | Extension connectée ? quotas, file, pause, derniers résultats |
 | `linkedin_cancel` | Vider la file d'attente |
 
@@ -85,10 +87,19 @@ Outils disponibles :
 discussion (retourne `{ messages: [{ sender, time, text }] }`, du plus ancien au
 plus récent). `linkedin_list_conversations` va sur la page messagerie et liste
 les conversations (`{ conversations: [{ name, snippet, time, unread }] }`) ;
-enchaînez avec `linkedin_read_messages` pour le détail. Les lectures ne
-consomment **pas** de quota journalier et n'ont qu'un petit délai (5–15 s) entre
-elles, mais restent séquentielles et déclenchent la pause de sécurité si
-LinkedIn affiche un captcha.
+enchaînez avec `linkedin_read_messages` pour le détail.
+`linkedin_view_profile` ouvre la page du profil et extrait les informations
+visibles (`{ profile: { name, headline, location, degree, connections,
+followers, about, experience, education } }` — les champs vides sont omis
+(économie de tokens) ; sur un profil hors réseau l'extraction peut être
+partielle). Les lectures ne consomment **pas** de quota journalier et n'ont
+qu'un petit délai (2–6 s) entre elles, mais restent séquentielles et
+déclenchent la pause de sécurité si LinkedIn affiche un captcha.
+
+**URL inexistante (404)** : si la page cible n'existe pas (profil supprimé ou
+renommé, faute de frappe dans le slug), l'outil échoue immédiatement avec
+« page LinkedIn introuvable (404) » — sans attendre les timeouts et **sans**
+déclencher de pause de sécurité (ce n'est pas un signal de détection).
 
 L'outil attend le verdict jusqu'à ~90 s ; au-delà (délai anti-détection en
 cours, extension déconnectée…), il répond « en file » et `linkedin_status`
