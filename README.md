@@ -42,8 +42,43 @@ Le reste de ce README décrit le mode **local**. Pour Cowork, suivez
 Réglages via variables d'environnement (dans `.mcp.json`, champ `env`) :
 `LI_MCP_PORT`, `LI_CAP_INVITE`, `LI_CAP_MESSAGE`, `LI_MIN_GAP_S`, `LI_MAX_GAP_S`,
 `LI_READ_MIN_GAP_S`, `LI_READ_MAX_GAP_S`, `LI_FAIL_PAUSE_MIN`,
-`LI_CHECKPOINT_PAUSE_MIN`, `LI_TOOL_WAIT_S`.
+`LI_CHECKPOINT_PAUSE_MIN`, `LI_TOOL_WAIT_S`, `LI_BATCH_WAIT_S`,
+`LI_MAX_PROFILES_PER_CALL`.
 **Les baisser est sûr ; les gonfler augmente le risque de restriction du compte.**
+
+### Rythme anti-détection
+
+Ce qui fait repérer un compte, ce n'est pas tant le volume que la **régularité** :
+une boucle qui enchaîne des actions à intervalle constant, sans pause, à toute
+heure, est le motif le plus facile à détecter. Le serveur impose donc trois
+garde-fous en plus des délais entre actions :
+
+| Garde-fou | Variables | Défaut |
+| --- | --- | --- |
+| Plafonds journaliers (lectures incluses) | `LI_CAP_VIEW`, `LI_CAP_READ` | 80 profils, 150 lectures |
+| Plafonds horaires (fenêtre glissante 60 min) | `LI_CAP_HOUR`, `LI_CAP_HOUR_VIEW` | 40 actions, 15 profils |
+| Micro-pauses entre séries | `LI_BURST_MIN`/`MAX`, `LI_BREAK_MIN_S`/`MAX_S` | pause 1 min 30–4 min toutes les 8–16 actions |
+| Plage horaire d'activité | `LI_ACTIVE_START`, `LI_ACTIVE_END`, `LI_TZ`, `LI_SKIP_WEEKEND` | 8h–20h, Europe/Paris |
+
+Les délais entre deux actions dépendent de la classe : envoi
+`LI_MIN_GAP_S`–`LI_MAX_GAP_S` (45–120 s), visite de profil
+`LI_VIEW_MIN_GAP_S`–`LI_VIEW_MAX_GAP_S` (20–60 s), lecture légère
+`LI_READ_MIN_GAP_S`–`LI_READ_MAX_GAP_S` (4–12 s).
+
+La **plage horaire ne s'applique qu'aux envois et aux visites de profil** :
+consulter sa messagerie le soir n'a rien d'anormal, enchaîner des visites de
+profil à 3 h du matin si. Mettre `LI_ACTIVE_START` et `LI_ACTIVE_END` à la même
+valeur désactive la plage.
+
+Conséquence pratique : les lots de profils s'étalent sur plusieurs minutes.
+`linkedin_view_profile` rend alors des `pending: [{ url, id }]` — rappelez-le
+avec `collect_ids: [...]` pour récupérer le résultat **sans rouvrir les pages**.
+Ne relancez jamais les mêmes URL pour « réessayer » : cela double l'exposition.
+
+`linkedin_status` affiche les compteurs du jour, ceux de la dernière heure, la
+micro-pause en cours et l'état de la plage horaire. Les plafonds horaires vivent
+en mémoire : un redémarrage du serveur les remet à zéro (les plafonds
+journaliers, eux, sont persistés dans `data/state.json`).
 
 ## Installation
 
@@ -79,7 +114,7 @@ Outils disponibles :
 | `linkedin_send_invitation` | Envoyer une invitation, note optionnelle (≤ 200 car.) |
 | `linkedin_read_messages` | Lire l'historique d'une conversation avec un profil (`/in/...`) |
 | `linkedin_list_conversations` | Lister les conversations récentes de la messagerie |
-| `linkedin_view_profile` | Voir un profil (`/in/...`) : nom, titre, à propos, expériences… |
+| `linkedin_view_profile` | Voir un ou plusieurs profils (`/in/...`) : nom, titre, à propos, expériences… |
 | `linkedin_status` | Extension connectée ? quotas, file, pause, derniers résultats |
 | `linkedin_cancel` | Vider la file d'attente |
 
@@ -92,7 +127,15 @@ enchaînez avec `linkedin_read_messages` pour le détail.
 visibles (`{ profile: { name, headline, location, degree, connections,
 followers, about, experience, education } }` — les champs vides sont omis
 (économie de tokens) ; sur un profil hors réseau l'extraction peut être
-partielle). Les lectures ne consomment **pas** de quota journalier et n'ont
+partielle). Il accepte une **liste** d'URL (`profile_urls`, 20 max par défaut,
+`LI_MAX_PROFILES_PER_CALL`) — un seul appel suffit pour tout un lot : les
+profils sont mis en file et lus l'un après l'autre, puis rendus ensemble sous la
+forme `{ profiles: [{ url, profile }], errors: [{ url, error }], pending: [{ url,
+id }] }`. Une URL invalide ou un profil en 404 n'interrompt pas le lot (il
+atterrit dans `errors`) ; si le lot dépasse l'attente maximale
+(`LI_BATCH_WAIT_S`, 600 s), les profils non encore lus restent en file et
+figurent dans `pending` — `linkedin_status` suit leur avancement.
+Les lectures ne consomment **pas** de quota journalier et n'ont
 qu'un petit délai (2–6 s) entre elles, mais restent séquentielles et
 déclenchent la pause de sécurité si LinkedIn affiche un captcha.
 

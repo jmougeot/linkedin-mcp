@@ -44,13 +44,33 @@ const BIND = process.env.LI_BIND || "127.0.0.1"; // 0.0.0.0 si exposé sans reve
 const PORT = Number(process.env.LI_MCP_PORT || 3210);
 const CAP_INVITE = Number(process.env.LI_CAP_INVITE || 20);   // plafond/jour
 const CAP_MESSAGE = Number(process.env.LI_CAP_MESSAGE || 40); // plafond/jour
+const CAP_VIEW = Number(process.env.LI_CAP_VIEW || 80);       // plafond/jour — visites de profil
+const CAP_READ = Number(process.env.LI_CAP_READ || 150);      // plafond/jour — lectures légères
 const MIN_GAP_S = Number(process.env.LI_MIN_GAP_S || 45);     // délai mini entre 2 envois
 const MAX_GAP_S = Number(process.env.LI_MAX_GAP_S || 120);    // délai maxi
-const READ_MIN_GAP_S = Number(process.env.LI_READ_MIN_GAP_S || 2); // délai mini entre 2 lectures
-const READ_MAX_GAP_S = Number(process.env.LI_READ_MAX_GAP_S || 6); // délai maxi
+const VIEW_MIN_GAP_S = Number(process.env.LI_VIEW_MIN_GAP_S || 20); // délai mini entre 2 visites de profil
+const VIEW_MAX_GAP_S = Number(process.env.LI_VIEW_MAX_GAP_S || 60); // délai maxi
+const READ_MIN_GAP_S = Number(process.env.LI_READ_MIN_GAP_S || 4); // délai mini entre 2 lectures légères
+const READ_MAX_GAP_S = Number(process.env.LI_READ_MAX_GAP_S || 12); // délai maxi
+
+// Rythme « humain » : volume horaire plafonné + micro-pauses + plage horaire.
+// C'est ce qui casse la signature d'une boucle automatisée — un débit régulier
+// et ininterrompu est bien plus détectable qu'un volume élevé mais irrégulier.
+const CAP_HOUR = Number(process.env.LI_CAP_HOUR || 40);           // actions/heure, tous types
+const CAP_HOUR_VIEW = Number(process.env.LI_CAP_HOUR_VIEW || 15); // visites de profil/heure
+const BURST_MIN = Number(process.env.LI_BURST_MIN || 8);   // actions d'affilée avant micro-pause (borne basse)
+const BURST_MAX = Number(process.env.LI_BURST_MAX || 16);  // idem (borne haute) — tiré au hasard
+const BREAK_MIN_S = Number(process.env.LI_BREAK_MIN_S || 90);  // micro-pause mini (1 min 30)
+const BREAK_MAX_S = Number(process.env.LI_BREAK_MAX_S || 240); // micro-pause maxi (4 min)
+const ACTIVE_START = Number(process.env.LI_ACTIVE_START ?? 8);  // heure locale de début d'activité
+const ACTIVE_END = Number(process.env.LI_ACTIVE_END ?? 20);     // heure locale de fin (exclue)
+const SKIP_WEEKEND = /^(1|true|yes)$/i.test(process.env.LI_SKIP_WEEKEND || "");
+const TZ = process.env.LI_TZ || "Europe/Paris";
 const FAIL_PAUSE_MIN = Number(process.env.LI_FAIL_PAUSE_MIN || 10);       // pause après échec simple
 const CHECKPOINT_PAUSE_MIN = Number(process.env.LI_CHECKPOINT_PAUSE_MIN || 60); // pause après captcha/checkpoint
 const TOOL_WAIT_S = Number(process.env.LI_TOOL_WAIT_S || 90); // attente max du résultat côté outil MCP
+const BATCH_WAIT_S = Number(process.env.LI_BATCH_WAIT_S || 1200); // attente max pour un lot de lectures
+const MAX_PROFILES_PER_CALL = Number(process.env.LI_MAX_PROFILES_PER_CALL || 10); // profils par appel
 const INFLIGHT_TIMEOUT_S = 300; // action servie mais jamais confirmée → échec
 
 // Les baisser est sûr ; les gonfler augmente le risque de restriction du compte.
@@ -63,12 +83,18 @@ function today() {
   return new Date().toISOString().slice(0, 10);
 }
 
+function freshCounters() {
+  return { date: today(), invite: 0, message: 0, view_profile: 0, read: 0 };
+}
+
 function loadState() {
   try {
     const s = JSON.parse(readFileSync(STATE_FILE, "utf8"));
-    if (s.date === today()) return s;
+    // Fusion avec les compteurs neufs : un state.json écrit par une version
+    // antérieure n'a ni view_profile ni read.
+    if (s.date === today()) return { ...freshCounters(), ...s };
   } catch {}
-  return { date: today(), invite: 0, message: 0 };
+  return freshCounters();
 }
 
 function saveState() {
@@ -84,7 +110,7 @@ let counters = loadState();
 
 function rollDay() {
   if (counters.date !== today()) {
-    counters = { date: today(), invite: 0, message: 0 };
+    counters = freshCounters();
     saveState();
   }
 }
@@ -100,20 +126,121 @@ let pausedUntil = 0;         // pause de sécurité après échec (epoch ms)
 let lastActionAt = 0;        // fin de la dernière action (epoch ms)
 let nextGapMs = 0;           // délai aléatoire imposé avant la prochaine action
 let lastPollAt = 0;          // dernier contact de l'extension (epoch ms)
+let recentActions = [];      // horodatages des actions de la dernière heure [{at, cls}]
+let burstCount = 0;          // actions effectuées depuis la dernière micro-pause
+let burstLimit = 0;          // seuil tiré au hasard déclenchant la micro-pause (0 = à tirer)
+let breakUntil = 0;          // micro-pause « humaine » en cours (epoch ms)
 
 const rand = (a, b) => a + Math.random() * (b - a);
 
-// Types d'action : les envois comptent dans les quotas et imposent le grand
-// délai anti-détection ; les lectures sont plus légères (pas de quota, délai
-// court) mais restent séquentielles et déclenchent la pause en cas de captcha.
+// Classes d'action, par ordre de risque décroissant :
+//   send → invitation/message : quota journalier, grand délai, plage horaire.
+//   view → visite de profil : c'est LE signal que LinkedIn surveille le plus.
+//          Quota journalier + horaire, délai long, plage horaire.
+//   read → messagerie/liste de conversations : léger, mais plafonné à l'heure
+//          et au jour pour qu'une boucle ne tourne pas indéfiniment.
+// Toutes les classes restent séquentielles et déclenchent la pause en cas de captcha.
 const SEND_TYPES = new Set(["invite", "message"]);
+const VIEW_TYPES = new Set(["view_profile"]);
+
+function classOf(type) {
+  return SEND_TYPES.has(type) ? "send" : VIEW_TYPES.has(type) ? "view" : "read";
+}
+
+/** Clé du compteur journalier : les lectures légères partagent le même seau. */
+function counterKey(type) {
+  const cls = classOf(type);
+  return cls === "send" ? type : cls === "view" ? "view_profile" : "read";
+}
 
 function extensionConnected() {
   return Date.now() - lastPollAt < 45_000;
 }
 
 function capFor(type) {
-  return type === "invite" ? CAP_INVITE : CAP_MESSAGE;
+  switch (classOf(type)) {
+    case "send": return type === "invite" ? CAP_INVITE : CAP_MESSAGE;
+    case "view": return CAP_VIEW;
+    default: return CAP_READ;
+  }
+}
+
+/** Délai aléatoire imposé après une action de ce type, en ms. */
+function gapMsFor(type) {
+  switch (classOf(type)) {
+    case "send": return rand(MIN_GAP_S, MAX_GAP_S) * 1000;
+    case "view": return rand(VIEW_MIN_GAP_S, VIEW_MAX_GAP_S) * 1000;
+    default: return rand(READ_MIN_GAP_S, READ_MAX_GAP_S) * 1000;
+  }
+}
+
+/** Purge la fenêtre glissante d'une heure et renvoie les actions restantes. */
+function pruneRecent(now = Date.now()) {
+  const cutoff = now - 3_600_000;
+  if (recentActions.length && recentActions[0].at < cutoff) {
+    recentActions = recentActions.filter((a) => a.at >= cutoff);
+  }
+  return recentActions;
+}
+
+/**
+ * Heure locale (fuseau LI_TZ) sous forme { hour, minute, weekend }.
+ * Passe par Intl plutôt que par un décalage fixe pour rester juste en
+ * heure d'été comme en heure d'hiver.
+ */
+function localClock(now = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: TZ, hourCycle: "h23", weekday: "short", hour: "2-digit", minute: "2-digit",
+  }).formatToParts(now);
+  const get = (t) => parts.find((p) => p.type === t)?.value || "";
+  return {
+    hour: Number(get("hour")),
+    minute: Number(get("minute")),
+    weekend: /^(Sat|Sun)$/.test(get("weekday")),
+  };
+}
+
+/**
+ * Fenêtre d'activité : hors plage, on ne fait ni envoi ni visite de profil.
+ * Les lectures légères restent permises (consulter ses messages le soir n'a
+ * rien d'anormal) mais restent soumises aux plafonds horaires.
+ * Renvoie null si l'action peut passer, sinon { wait, reason }.
+ */
+function activeWindowCheck(type) {
+  if (classOf(type) === "read") return null;
+  if (ACTIVE_START >= ACTIVE_END) return null; // plage désactivée (ex. 0/0)
+  const { hour, minute, weekend } = localClock();
+  const inHours = hour >= ACTIVE_START && hour < ACTIVE_END;
+  if (inHours && !(SKIP_WEEKEND && weekend)) return null;
+  // Attente ré-évaluée au plus tard dans 15 min : évite tout calcul de bascule
+  // de jour/fuseau, l'extension repasse simplement plus tard.
+  const untilStartS = inHours ? 900 : ((ACTIVE_START - hour + 24) % 24) * 3600 - minute * 60;
+  return {
+    wait: Math.max(60, Math.min(900, untilStartS)),
+    reason: `Hors plage d'activité (${ACTIVE_START}h–${ACTIVE_END}h ${TZ}${SKIP_WEEKEND ? ", hors week-end" : ""})`,
+  };
+}
+
+/**
+ * Plafonds horaires (fenêtre glissante de 60 min).
+ * Renvoie null si l'action peut passer, sinon { wait, reason }.
+ */
+function hourlyCheck(type, now = Date.now()) {
+  const recent = pruneRecent(now);
+  const isView = classOf(type) === "view";
+  const waitFor = (list, cap, label) => {
+    if (list.length < cap) return null;
+    // On peut repartir quand la plus ancienne action du lot sort de la fenêtre.
+    const oldest = list[list.length - cap].at;
+    return {
+      wait: Math.max(60, Math.ceil((oldest + 3_600_000 - now) / 1000)),
+      reason: `Plafond horaire atteint (${list.length}/${cap} ${label} sur les 60 dernières minutes)`,
+    };
+  };
+  return (
+    (isView ? waitFor(recent.filter((a) => a.cls === "view"), CAP_HOUR_VIEW, "visites de profil") : null) ||
+    waitFor(recent, CAP_HOUR, "actions")
+  );
 }
 
 function notifyExtension() {
@@ -124,13 +251,28 @@ function notifyExtension() {
 
 function recordResult(action, ok, error, data) {
   rollDay();
-  const isSend = SEND_TYPES.has(action.type);
-  if (ok && isSend) {
-    counters[action.type] = (counters[action.type] || 0) + 1;
+  const cls = classOf(action.type);
+  const isSend = cls === "send";
+  // Envoi : compté seulement s'il a abouti. Lecture/visite : comptée dans tous
+  // les cas — la page a été ouverte, donc LinkedIn l'a vue, succès ou non.
+  if (ok || !isSend) {
+    counters[counterKey(action.type)] = (counters[counterKey(action.type)] || 0) + 1;
     saveState();
   }
-  lastActionAt = Date.now();
-  nextGapMs = isSend ? rand(MIN_GAP_S, MAX_GAP_S) * 1000 : rand(READ_MIN_GAP_S, READ_MAX_GAP_S) * 1000;
+  const now = Date.now();
+  lastActionAt = now;
+  nextGapMs = gapMsFor(action.type);
+  pruneRecent(now).push({ at: now, cls });
+
+  // Micro-pause « humaine » : après une série d'actions, on s'arrête plusieurs
+  // minutes. Un débit parfaitement régulier sur des heures est le marqueur
+  // d'automatisation le plus facile à repérer côté LinkedIn.
+  if (!burstLimit) burstLimit = Math.round(rand(BURST_MIN, BURST_MAX));
+  if (++burstCount >= burstLimit) {
+    breakUntil = now + rand(BREAK_MIN_S, BREAK_MAX_S) * 1000;
+    burstCount = 0;
+    burstLimit = 0; // nouveau seuil tiré à la prochaine action
+  }
   if (!ok) {
     const critical = /checkpoint|captcha|challenge|contrôle de sécurité/i.test(error || "");
     // Page 404 (profil supprimé / URL erronée) : échec « normal », pas un signal
@@ -166,16 +308,19 @@ setInterval(() => {
 // --- Mise en file (appelée par les outils MCP) --------------------------------
 function enqueue(type, linkedinUrl, body, extra = {}) {
   rollDay();
-  if (SEND_TYPES.has(type)) {
-    if (counters[type] >= capFor(type)) {
-      throw new Error(
-        `Plafond journalier atteint pour "${type}" (${counters[type]}/${capFor(type)}). Réessayez demain ou augmentez LI_CAP_${type.toUpperCase()} (déconseillé).`
-      );
-    }
-    const pendingSameType = queue.filter((a) => a.type === type).length;
-    if (counters[type] + pendingSameType >= capFor(type)) {
-      throw new Error(`La file contient déjà assez d'actions "${type}" pour atteindre le plafond journalier.`);
-    }
+  // Plafond journalier — appliqué à tous les types, y compris les lectures :
+  // c'est ce qui empêche une boucle de tourner sans fin sur la journée.
+  const key = counterKey(type);
+  const cap = capFor(type);
+  const envVar = key === "read" ? "LI_CAP_READ" : key === "view_profile" ? "LI_CAP_VIEW" : `LI_CAP_${key.toUpperCase()}`;
+  if (counters[key] >= cap) {
+    throw new Error(
+      `Plafond journalier atteint pour "${key}" (${counters[key]}/${cap}). Réessayez demain ou augmentez ${envVar} (déconseillé).`
+    );
+  }
+  const pendingSameKey = queue.filter((a) => counterKey(a.type) === key).length;
+  if (counters[key] + pendingSameKey >= cap) {
+    throw new Error(`La file contient déjà assez d'actions "${key}" pour atteindre le plafond journalier (${cap}).`);
   }
   const action = {
     id: randomUUID(),
@@ -203,6 +348,14 @@ function waitForResult(id, timeoutS = TOOL_WAIT_S) {
   });
 }
 
+/**
+ * Retrouve un résultat déjà enregistré à partir de son id d'action.
+ * L'historique ne garde que les 50 derniers résultats : au-delà, l'id est perdu.
+ */
+function findResult(id) {
+  return results.find((r) => r.id === id);
+}
+
 function statusSnapshot() {
   rollDay();
   return {
@@ -214,6 +367,12 @@ function statusSnapshot() {
     today: {
       invite: { sent: counters.invite, cap: CAP_INVITE },
       message: { sent: counters.message, cap: CAP_MESSAGE },
+      view_profile: { done: counters.view_profile, cap: CAP_VIEW },
+      read: { done: counters.read, cap: CAP_READ },
+    },
+    last_hour: {
+      actions: { done: pruneRecent().length, cap: CAP_HOUR },
+      view_profile: { done: pruneRecent().filter((a) => a.cls === "view").length, cap: CAP_HOUR_VIEW },
     },
     queue: {
       pending: queue.length + inFlight.size,
@@ -222,6 +381,15 @@ function statusSnapshot() {
       })),
     },
     safety_pause_until: pausedUntil > Date.now() ? new Date(pausedUntil).toISOString() : null,
+    human_break_until: breakUntil > Date.now() ? new Date(breakUntil).toISOString() : null,
+    active_window: {
+      hours: ACTIVE_START >= ACTIVE_END ? "désactivée" : `${ACTIVE_START}h–${ACTIVE_END}h`,
+      timezone: TZ,
+      skip_weekend: SKIP_WEEKEND,
+      // Ne concerne que les envois et les visites de profil ; les lectures
+      // légères passent à toute heure (dans la limite des plafonds).
+      open_for_sends: activeWindowCheck("invite") === null,
+    },
     // data omis (peut être volumineux) — les lectures rendent leur contenu via leur propre outil
     recent_results: results.slice(-10).map(({ data, ...rest }) => ({ ...rest, has_data: data != null })),
   };
@@ -264,13 +432,29 @@ function nextDecision() {
     return { wait: Math.ceil((pausedUntil - now) / 1000), reason: "Pause de sécurité après échec" };
   }
   if (!queue.length) return null;
+  if (breakUntil > now) {
+    return { wait: Math.ceil((breakUntil - now) / 1000), reason: "Micro-pause (rythme humain)" };
+  }
   const gapEnd = lastActionAt + nextGapMs;
   if (gapEnd > now) {
     return { wait: Math.ceil((gapEnd - now) / 1000), reason: "Délai anti-détection entre deux actions" };
   }
-  const action = queue.shift();
-  inFlight.set(action.id, { action, servedAt: now });
-  return { action };
+  // On sert la première action *éligible*, pas forcément la tête de file : une
+  // lecture ne doit pas rester bloquée derrière un envoi qui attend l'ouverture
+  // de la plage horaire. Si rien n'est éligible, on renvoie l'attente la plus
+  // courte pour que l'extension repasse au bon moment.
+  let blocked = null;
+  for (let i = 0; i < queue.length; i++) {
+    const veto = activeWindowCheck(queue[i].type) || hourlyCheck(queue[i].type, now);
+    if (veto) {
+      if (!blocked || veto.wait < blocked.wait) blocked = veto;
+      continue;
+    }
+    const [action] = queue.splice(i, 1);
+    inFlight.set(action.id, { action, servedAt: now });
+    return { action };
+  }
+  return blocked;
 }
 
 // --- Transport MCP distant (Streamable HTTP), utilisé en mode http ------------
@@ -573,7 +757,7 @@ function describeReadOutcome(action, result, what) {
         (extensionConnected()
           ? "une pause de sécurité ou une action précédente est probablement en cours."
           : "l'extension Chrome ne semble PAS connectée (onglet Chrome ouvert ? extension chargée et activée ?).") +
-        ` Utilisez linkedin_status pour vérifier.`
+        ` Récupérez le résultat avec linkedin_status result_id="${action.id}" plutôt que de relancer la lecture.`
     );
   }
   // JSON compact (pas de pretty-print) : l'indentation coûtait ~30 % de tokens en plus.
@@ -638,23 +822,104 @@ mcp.registerTool(
 mcp.registerTool(
   "linkedin_view_profile",
   {
-    title: "Voir un profil LinkedIn",
+    title: "Voir un ou plusieurs profils LinkedIn",
     description:
-      "Ouvre un profil LinkedIn (/in/...) via l'extension Chrome et extrait les informations visibles : " +
+      "Ouvre un ou plusieurs profils LinkedIn (/in/...) via l'extension Chrome et extrait les informations visibles : " +
       "nom, titre, localisation, niveau de relation, à propos, expériences, formation. " +
-      "Retourne un JSON { profile: {...} }. Lecture sans quota journalier (petit délai anti-détection).",
+      `Accepte une LISTE d'URL (profile_urls, jusqu'à ${MAX_PROFILES_PER_CALL}) — préférez un seul appel avec toutes les URL ` +
+      "plutôt qu'un appel par profil : les profils sont lus l'un après l'autre (délai anti-détection) et le résultat est rendu en une fois. " +
+      "Retourne un JSON { profiles: [{ url, profile }], errors: [{ url, error }], pending: [{ url, id }] }. " +
+      `La visite de profil est l'action la plus surveillée par LinkedIn : elle est plafonnée à ${CAP_VIEW}/jour ` +
+      `et ${CAP_HOUR_VIEW}/heure, avec un délai de ${VIEW_MIN_GAP_S}–${VIEW_MAX_GAP_S} s entre deux profils. ` +
+      "N'enchaînez pas les appels en boucle : consultez linkedin_status si les lectures restent en attente.",
     inputSchema: {
-      profile_url: z.string().url().describe("URL du profil LinkedIn, ex. https://www.linkedin.com/in/jean-dupont/"),
+      profile_urls: z
+        .array(z.string().url())
+        .min(1)
+        .max(MAX_PROFILES_PER_CALL)
+        .optional()
+        .describe(`Liste d'URL de profils LinkedIn (max ${MAX_PROFILES_PER_CALL}), ex. ["https://www.linkedin.com/in/jean-dupont/", "https://www.linkedin.com/in/marie-martin/"]`),
+      profile_url: z
+        .string()
+        .url()
+        .optional()
+        .describe("URL d'un seul profil (raccourci équivalent à profile_urls avec une seule entrée)."),
+      collect_ids: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Récupère le résultat de lectures déjà mises en file : passez les id rendus dans « pending » par un appel précédent. " +
+            "N'ouvre AUCUNE nouvelle page et ne consomme aucun quota. À utiliser au lieu de relancer les mêmes URL."
+        ),
     },
   },
-  async ({ profile_url }) => {
+  async ({ profile_urls, profile_url, collect_ids }) => {
     requireHttp();
-    if (!/linkedin\.com\/in\//i.test(profile_url)) {
-      throw new Error("L'URL doit être un profil LinkedIn (https://www.linkedin.com/in/...).");
+
+    // Mode récupération : les lectures en file avec de longs délais dépassent
+    // souvent l'attente d'un seul appel. Plutôt que de relire les profils (et
+    // de doubler l'exposition), on relit le résultat déjà enregistré.
+    if (collect_ids?.length) {
+      const profiles = [], errors = [], pending = [];
+      const collected = await Promise.all(
+        collect_ids.map(async (id) => {
+          const stored = findResult(id);
+          if (stored) return { id, result: stored };
+          if (!queue.some((a) => a.id === id) && !inFlight.has(id)) return { id, result: undefined };
+          return { id, result: await waitForResult(id, TOOL_WAIT_S) };
+        })
+      );
+      for (const { id, result } of collected) {
+        if (result === undefined) errors.push({ id, error: "id inconnu (résultat trop ancien ou jamais mis en file)" });
+        else if (result === null) pending.push({ id });
+        else if (result.ok) profiles.push({ url: result.target, ...(result.data || {}) });
+        else errors.push({ url: result.target, id, error: result.error || "erreur inconnue" });
+      }
+      return text(JSON.stringify({ profiles, errors, pending }));
     }
-    const action = enqueue("view_profile", profile_url, "");
-    const result = await waitForResult(action.id);
-    return describeReadOutcome(action, result, profile_url);
+
+    // Dédoublonnage : deux fois la même URL = deux ouvertures de page pour rien.
+    const urls = [...new Set([...(profile_urls || []), ...(profile_url ? [profile_url] : [])])];
+    if (!urls.length) throw new Error("Fournissez profile_urls (liste d'URL), profile_url (une seule URL) ou collect_ids.");
+    if (urls.length > MAX_PROFILES_PER_CALL) {
+      throw new Error(`Trop de profils (${urls.length}) : maximum ${MAX_PROFILES_PER_CALL} par appel.`);
+    }
+
+    // Une URL invalide ne fait pas échouer tout le lot : elle est rendue en erreur.
+    const errors = [];
+    const valid = [];
+    for (const url of urls) {
+      if (/linkedin\.com\/in\//i.test(url)) valid.push(url);
+      else errors.push({ url, error: "l'URL doit être un profil LinkedIn (https://www.linkedin.com/in/...)" });
+    }
+    if (!valid.length) return text(JSON.stringify({ profiles: [], errors, pending: [] }));
+
+    const actions = valid.map((url) => ({ url, action: enqueue("view_profile", url, "") }));
+    // Les lectures sont séquentielles : l'attente grandit avec la taille du lot.
+    const waitS = Math.min(BATCH_WAIT_S, TOOL_WAIT_S * actions.length);
+    const outcomes = await Promise.all(actions.map(({ action }) => waitForResult(action.id, waitS)));
+
+    const profiles = [];
+    const pending = [];
+    outcomes.forEach((result, i) => {
+      const { url, action } = actions[i];
+      if (result === null) pending.push({ url, id: action.id });
+      else if (result.ok) profiles.push({ url, ...(result.data || {}) });
+      else errors.push({ url, error: result.error || "erreur inconnue" });
+    });
+
+    if (!profiles.length && !errors.length && pending.length) {
+      return text(
+        `⏳ ${pending.length} lecture(s) de profil en file mais pas encore terminée(s) après ${waitS}s — ` +
+          (extensionConnected()
+            ? "une pause de sécurité ou une action précédente est probablement en cours."
+            : "l'extension Chrome ne semble PAS connectée (onglet Chrome ouvert ? extension chargée et activée ?).") +
+          ` Vérifiez avec linkedin_status, puis récupérez le résultat avec collect_ids=${JSON.stringify(pending.map((p) => p.id))} ` +
+          `— ne relancez PAS les mêmes URL, elles seraient rouvertes une seconde fois.`
+      );
+    }
+    // JSON compact (pas de pretty-print) : l'indentation coûtait ~30 % de tokens en plus.
+    return text(JSON.stringify({ profiles, errors, pending }));
   }
 );
 
@@ -663,10 +928,30 @@ mcp.registerTool(
   {
     title: "État LinkedIn (extension, quotas, file)",
     description:
-      "État du pont LinkedIn : extension Chrome connectée ou non, quotas du jour, actions en file, pause de sécurité éventuelle, et derniers résultats.",
-    inputSchema: {},
+      "État du pont LinkedIn : extension Chrome connectée ou non, quotas du jour et de la dernière heure, actions en file, " +
+      "pause de sécurité ou micro-pause en cours, plage horaire d'activité, et derniers résultats. " +
+      "Avec result_id, rend le contenu complet d'une lecture rendue « en attente » par un appel précédent — " +
+      "à préférer systématiquement à une relance de la même lecture, qui rouvrirait la page pour rien.",
+    inputSchema: {
+      result_id: z
+        .string()
+        .optional()
+        .describe("Id d'une action rendue « en file / pas encore terminée » : renvoie son résultat complet s'il est arrivé depuis."),
+    },
   },
-  async () => text(JSON.stringify(statusSnapshot()))
+  async ({ result_id }) => {
+    if (result_id) {
+      const stored = findResult(result_id);
+      if (stored) return text(JSON.stringify(stored));
+      const waiting = queue.some((a) => a.id === result_id) || inFlight.has(result_id);
+      return text(
+        waiting
+          ? `⏳ L'action ${result_id} est toujours en file (délai anti-détection ou micro-pause). Rappelez linkedin_status avec le même result_id dans quelques minutes.`
+          : `❌ Id ${result_id} inconnu : résultat trop ancien (seuls les 50 derniers sont gardés) ou jamais mis en file.`
+      );
+    }
+    return text(JSON.stringify(statusSnapshot()));
+  }
 );
 
 mcp.registerTool(
