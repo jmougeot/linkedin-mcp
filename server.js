@@ -502,6 +502,15 @@ async function handleMcpHttp(req, res) {
       };
       const server = buildMcpServer();
       await server.connect(transport);
+    } else if (sessionId) {
+      // Session inconnue — typiquement : le serveur a redémarré (sessions en
+      // mémoire). La spec MCP impose 404 : le client rouvre alors une session
+      // (initialize) de lui-même. Un 400 le laisse bloqué sur l'ancienne.
+      return json(res, 404, {
+        jsonrpc: "2.0",
+        error: { code: -32001, message: "Session MCP expirée (serveur redémarré) — reconnexion" },
+        id: null,
+      });
     } else {
       return json(res, 400, {
         jsonrpc: "2.0",
