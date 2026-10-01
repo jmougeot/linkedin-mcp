@@ -4,8 +4,8 @@
  *
  * Deux faces :
  *  1. MCP  : Claude appelle linkedin_send_message / _send_invitation /
- *            _read_messages / _list_conversations / _view_profile / _status /
- *            _cancel. Chaque
+ *            _read_messages / _list_conversations / _view_profile /
+ *            _search_people / _status / _cancel. Chaque
  *            action est mise en FILE, jamais exécutée directement — c'est
  *            l'extension qui agit.
  *  2. HTTP : l'extension Chrome interroge ce serveur (long-poll) pour savoir si
@@ -46,10 +46,11 @@ const CAP_INVITE = Number(process.env.LI_CAP_INVITE || 20);   // plafond/jour
 const CAP_MESSAGE = Number(process.env.LI_CAP_MESSAGE || 40); // plafond/jour
 const CAP_VIEW = Number(process.env.LI_CAP_VIEW || 80);       // plafond/jour — visites de profil
 const CAP_READ = Number(process.env.LI_CAP_READ || 150);      // plafond/jour — lectures légères
+const CAP_SEARCH = Number(process.env.LI_CAP_SEARCH || 30);   // plafond/jour — pages de recherche de profils
 const MIN_GAP_S = Number(process.env.LI_MIN_GAP_S || 45);     // délai mini entre 2 envois
 const MAX_GAP_S = Number(process.env.LI_MAX_GAP_S || 120);    // délai maxi
-const VIEW_MIN_GAP_S = Number(process.env.LI_VIEW_MIN_GAP_S || 20); // délai mini entre 2 visites de profil
-const VIEW_MAX_GAP_S = Number(process.env.LI_VIEW_MAX_GAP_S || 60); // délai maxi
+const VIEW_MIN_GAP_S = Number(process.env.LI_VIEW_MIN_GAP_S || 6); // délai mini entre 2 visites de profil
+const VIEW_MAX_GAP_S = Number(process.env.LI_VIEW_MAX_GAP_S || 10); // délai maxi
 const READ_MIN_GAP_S = Number(process.env.LI_READ_MIN_GAP_S || 4); // délai mini entre 2 lectures légères
 const READ_MAX_GAP_S = Number(process.env.LI_READ_MAX_GAP_S || 12); // délai maxi
 
@@ -84,14 +85,14 @@ function today() {
 }
 
 function freshCounters() {
-  return { date: today(), invite: 0, message: 0, view_profile: 0, read: 0 };
+  return { date: today(), invite: 0, message: 0, view_profile: 0, search: 0, read: 0 };
 }
 
 function loadState() {
   try {
     const s = JSON.parse(readFileSync(STATE_FILE, "utf8"));
     // Fusion avec les compteurs neufs : un state.json écrit par une version
-    // antérieure n'a ni view_profile ni read.
+    // antérieure n'a ni view_profile, ni search, ni read.
     if (s.date === today()) return { ...freshCounters(), ...s };
   } catch {}
   return freshCounters();
@@ -137,20 +138,24 @@ const rand = (a, b) => a + Math.random() * (b - a);
 //   send → invitation/message : quota journalier, grand délai, plage horaire.
 //   view → visite de profil : c'est LE signal que LinkedIn surveille le plus.
 //          Quota journalier + horaire, délai long, plage horaire.
+//   search → page de résultats de recherche de personnes : LinkedIn limite
+//          lui-même le volume (« limite d'utilisation commerciale » des comptes
+//          gratuits). Quota journalier propre, délai et plage d'une visite.
 //   read → messagerie/liste de conversations : léger, mais plafonné à l'heure
 //          et au jour pour qu'une boucle ne tourne pas indéfiniment.
 // Toutes les classes restent séquentielles et déclenchent la pause en cas de captcha.
 const SEND_TYPES = new Set(["invite", "message"]);
 const VIEW_TYPES = new Set(["view_profile"]);
+const SEARCH_TYPES = new Set(["search_people"]);
 
 function classOf(type) {
-  return SEND_TYPES.has(type) ? "send" : VIEW_TYPES.has(type) ? "view" : "read";
+  return SEND_TYPES.has(type) ? "send" : VIEW_TYPES.has(type) ? "view" : SEARCH_TYPES.has(type) ? "search" : "read";
 }
 
 /** Clé du compteur journalier : les lectures légères partagent le même seau. */
 function counterKey(type) {
   const cls = classOf(type);
-  return cls === "send" ? type : cls === "view" ? "view_profile" : "read";
+  return cls === "send" ? type : cls === "view" ? "view_profile" : cls === "search" ? "search" : "read";
 }
 
 function extensionConnected() {
@@ -161,6 +166,7 @@ function capFor(type) {
   switch (classOf(type)) {
     case "send": return type === "invite" ? CAP_INVITE : CAP_MESSAGE;
     case "view": return CAP_VIEW;
+    case "search": return CAP_SEARCH;
     default: return CAP_READ;
   }
 }
@@ -169,7 +175,8 @@ function capFor(type) {
 function gapMsFor(type) {
   switch (classOf(type)) {
     case "send": return rand(MIN_GAP_S, MAX_GAP_S) * 1000;
-    case "view": return rand(VIEW_MIN_GAP_S, VIEW_MAX_GAP_S) * 1000;
+    case "view":
+    case "search": return rand(VIEW_MIN_GAP_S, VIEW_MAX_GAP_S) * 1000;
     default: return rand(READ_MIN_GAP_S, READ_MAX_GAP_S) * 1000;
   }
 }
@@ -201,7 +208,8 @@ function localClock(now = new Date()) {
 }
 
 /**
- * Fenêtre d'activité : hors plage, on ne fait ni envoi ni visite de profil.
+ * Fenêtre d'activité : hors plage, on ne fait ni envoi, ni visite de profil,
+ * ni recherche.
  * Les lectures légères restent permises (consulter ses messages le soir n'a
  * rien d'anormal) mais restent soumises aux plafonds horaires.
  * Renvoie null si l'action peut passer, sinon { wait, reason }.
@@ -282,7 +290,7 @@ function recordResult(action, ok, error, data) {
     if (pauseMin) pausedUntil = Date.now() + pauseMin * 60_000;
   }
   const r = {
-    id: action.id, type: action.type, target: action.linkedin || action.thread || (action.open ? "conversation-ouverte" : action.conv_name) || null,
+    id: action.id, type: action.type, target: action.linkedin || action.search_url || action.thread || (action.open ? "conversation-ouverte" : action.conv_name) || null,
     ok, error: error || null, data: data || null, at: new Date().toISOString(),
   };
   results.push(r);
@@ -324,7 +332,7 @@ function enqueue(type, linkedinUrl, body, extra = {}) {
   }
   const action = {
     id: randomUUID(),
-    type, // "invite" | "message" | "read_messages" | "list_conversations" | "view_profile"
+    type, // "invite" | "message" | "read_messages" | "list_conversations" | "view_profile" | "search_people"
     linkedin: linkedinUrl || null,
     body: body || "",
     ...extra,
@@ -368,6 +376,7 @@ function statusSnapshot() {
       invite: { sent: counters.invite, cap: CAP_INVITE },
       message: { sent: counters.message, cap: CAP_MESSAGE },
       view_profile: { done: counters.view_profile, cap: CAP_VIEW },
+      search: { done: counters.search, cap: CAP_SEARCH },
       read: { done: counters.read, cap: CAP_READ },
     },
     last_hour: {
@@ -377,7 +386,7 @@ function statusSnapshot() {
     queue: {
       pending: queue.length + inFlight.size,
       items: [...queue, ...[...inFlight.values()].map((f) => f.action)].map((a) => ({
-        id: a.id, type: a.type, target: a.linkedin || a.thread || a.conv_name || null,
+        id: a.id, type: a.type, target: a.linkedin || a.search_url || a.thread || a.conv_name || null,
       })),
     },
     safety_pause_until: pausedUntil > Date.now() ? new Date(pausedUntil).toISOString() : null,
@@ -386,7 +395,7 @@ function statusSnapshot() {
       hours: ACTIVE_START >= ACTIVE_END ? "désactivée" : `${ACTIVE_START}h–${ACTIVE_END}h`,
       timezone: TZ,
       skip_weekend: SKIP_WEEKEND,
-      // Ne concerne que les envois et les visites de profil ; les lectures
+      // Ne concerne que les envois, visites de profil et recherches ; les lectures
       // légères passent à toute heure (dans la limite des plafonds).
       open_for_sends: activeWindowCheck("invite") === null,
     },
@@ -666,6 +675,33 @@ function resolveTarget({ use_open_conversation, conversation_name, profile_url, 
   );
 }
 
+/**
+ * URL de la recherche « Personnes » de LinkedIn. Les champs nom/poste/
+ * entreprise/école sont ceux du panneau « Tous les filtres » (texte libre —
+ * les filtres par id d'entreprise ou de lieu exigeraient des URN internes).
+ * Le niveau de relation suit le codage LinkedIn : F = 1er, S = 2e, O = 3e+.
+ */
+function peopleSearchUrl({ keywords, first_name, last_name, title, company, school, network, page }) {
+  const fields = {
+    keywords, firstName: first_name, lastName: last_name,
+    titleFreeText: title, company, schoolFreeText: school,
+  };
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(fields)) if (v && v.trim()) params.set(k, v.trim());
+  if (![...params.keys()].length) {
+    throw new Error("Critère manquant : fournir au moins keywords, first_name, last_name, title, company ou school.");
+  }
+  if (network?.length) {
+    const codes = { 1: "F", 2: "S", 3: "O" };
+    params.set("network", JSON.stringify([...new Set(network)].map((n) => codes[n])));
+  }
+  const faceted = network?.length || [...params.keys()].some((k) => k !== "keywords");
+  params.set("origin", faceted ? "FACETED_SEARCH" : "GLOBAL_SEARCH_HEADER");
+  if (page && page > 1) params.set("page", String(page));
+  // Espaces en %20 comme dans les URL de LinkedIn (URLSearchParams met des « + »).
+  return `https://www.linkedin.com/search/results/people/?${params.toString().replace(/\+/g, "%20")}`;
+}
+
 function describeOutcome(action, result, verb) {
   if (result === null) {
     return text(
@@ -920,6 +956,42 @@ mcp.registerTool(
     }
     // JSON compact (pas de pretty-print) : l'indentation coûtait ~30 % de tokens en plus.
     return text(JSON.stringify({ profiles, errors, pending }));
+  }
+);
+
+mcp.registerTool(
+  "linkedin_search_people",
+  {
+    title: "Rechercher des profils LinkedIn",
+    description:
+      "Recherche des personnes sur LinkedIn (page « Personnes » de la recherche) via l'extension Chrome et rend UNE page de résultats (10 profils max) : " +
+      "nom, URL du profil, niveau de relation, titre, localisation, et la ligne de contexte (poste actuel, relations en commun). " +
+      "Critères combinables : keywords (texte libre — on peut y mettre une ville), first_name, last_name, title, company, school, network (niveaux de relation). " +
+      "Retourne un JSON { page, total, has_next, results: [{ name, url, degree, headline, location, summary }] }. " +
+      "Pour le détail d'un profil, enchaîner avec linkedin_view_profile en passant toutes les URL retenues dans UN seul appel. " +
+      `Chaque page de résultats compte comme une recherche : plafond ${CAP_SEARCH}/jour, délai de ${VIEW_MIN_GAP_S}–${VIEW_MAX_GAP_S} s entre deux pages, ` +
+      "et LinkedIn limite lui-même les recherches des comptes gratuits. Affinez les critères plutôt que de parcourir de nombreuses pages.",
+    inputSchema: {
+      keywords: z.string().min(1).max(200).optional().describe("Mots-clés libres, ex. « directeur commercial SaaS Lyon »"),
+      first_name: z.string().min(1).max(100).optional().describe("Prénom exact"),
+      last_name: z.string().min(1).max(100).optional().describe("Nom de famille exact"),
+      title: z.string().min(1).max(150).optional().describe("Intitulé de poste, ex. « CTO »"),
+      company: z.string().min(1).max(150).optional().describe("Entreprise (nom libre), ex. « Doctolib »"),
+      school: z.string().min(1).max(150).optional().describe("École / université (nom libre), ex. « Centrale Méditerranée »"),
+      network: z
+        .array(z.enum(["1", "2", "3"]))
+        .min(1)
+        .optional()
+        .describe("Niveaux de relation à garder : \"1\" = relations directes, \"2\" = 2e niveau, \"3\" = 3e niveau et au-delà. Défaut : tous."),
+      page: z.number().int().min(1).max(10).optional().describe("Page de résultats (10 par page, défaut 1)"),
+    },
+  },
+  async ({ keywords, first_name, last_name, title, company, school, network, page }) => {
+    requireHttp();
+    const searchUrl = peopleSearchUrl({ keywords, first_name, last_name, title, company, school, network, page });
+    const action = enqueue("search_people", null, "", { search_url: searchUrl, page: page || 1 });
+    const result = await waitForResult(action.id);
+    return describeReadOutcome(action, result, "recherche de profils");
   }
 );
 

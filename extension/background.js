@@ -79,6 +79,7 @@ async function tick() {
         read_messages: "Lecture de conversation",
         list_conversations: "Lecture de la messagerie",
         view_profile: "Lecture de profil",
+        search_people: "Recherche de profils",
       };
       await setStatus({ kind: "run", text: `${LABELS[res.action.type] || res.action.type} en cours…` });
       const verdict = await runAction(res.action);
@@ -205,15 +206,15 @@ async function sendToTab(tabId, payload, tries = 12) {
  */
 async function runAction(action) {
   try {
-    // Lecture de profil : dans la fenêtre de travail dédiée (coin d'écran, sans
-    // focus) — l'utilisateur n'est jamais interrompu.
+    // Lecture de profil et recherche : dans la fenêtre de travail dédiée (coin
+    // d'écran, sans focus) — l'utilisateur n'est jamais interrompu.
     // Délai de stabilisation : la SPA LinkedIn continue de se poser après
     // l'événement "complete" — mais seulement quand on vient de NAVIGUER.
     // Page déjà chargée : délai court (le content script a ses propres waitFor).
     const settle = (navigated) =>
       new Promise((r) => setTimeout(r, navigated ? 1200 + Math.random() * 1300 : 300 + Math.random() * 400));
-    if (action.type === "view_profile") {
-      const url = profileUrl(action.linkedin);
+    if (action.type === "view_profile" || action.type === "search_people") {
+      const url = action.type === "search_people" ? action.search_url : profileUrl(action.linkedin);
       const tab = await ensureWorkerTab(url);
       const current = ((tab.pendingUrl || tab.url) || "").replace(/\/+$/, "");
       let navigated = tab.status !== "complete";
@@ -225,7 +226,35 @@ async function runAction(action) {
         await waitForLoad(tab.id);
       }
       await settle(navigated);
-      return await sendToTab(tab.id, { type: "li-action", action });
+      // Fenêtre de travail entièrement recouverte (macOS : occlusion = page
+      // « hidden ») → LinkedIn ne rend pas Expériences/Formation. Dernier
+      // recours : on la passe devant le temps de la lecture, puis on rend le
+      // focus à la fenêtre de l'utilisateur.
+      let restoreWinId = null;
+      try {
+        const [vis] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: () => document.visibilityState,
+        });
+        if (vis?.result === "hidden") {
+          const prev = await chrome.windows.getLastFocused();
+          if (prev.id !== tab.windowId) restoreWinId = prev.id;
+          await chrome.windows.update(tab.windowId, { focused: true });
+          await new Promise((r) => setTimeout(r, 800));
+        }
+      } catch {}
+      // Recherche : message dédié « li-search ». Un content.js périmé (servi par
+      // le cache de Chrome) ne connaît que « li-action » et y tomberait sur son
+      // cas par défaut, doInvite — il cliquerait « Se connecter » sur le premier
+      // résultat. Avec un type qu'il ignore, il ne fait rien.
+      const msgType = action.type === "search_people" ? "li-search" : "li-action";
+      try {
+        return await sendToTab(tab.id, { type: msgType, action });
+      } finally {
+        if (restoreWinId != null) {
+          try { await chrome.windows.update(restoreWinId, { focused: true }); } catch {}
+        }
+      }
     }
     const tab = await ensureTab();
     // Mode « conversation ouverte » : on N'ouvre RIEN, on agit sur l'onglet tel quel.

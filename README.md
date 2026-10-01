@@ -55,17 +55,19 @@ garde-fous en plus des délais entre actions :
 
 | Garde-fou | Variables | Défaut |
 | --- | --- | --- |
-| Plafonds journaliers (lectures incluses) | `LI_CAP_VIEW`, `LI_CAP_READ` | 80 profils, 150 lectures |
+| Plafonds journaliers (lectures incluses) | `LI_CAP_VIEW`, `LI_CAP_SEARCH`, `LI_CAP_READ` | 80 profils, 30 pages de recherche, 150 lectures |
 | Plafonds horaires (fenêtre glissante 60 min) | `LI_CAP_HOUR`, `LI_CAP_HOUR_VIEW` | 40 actions, 15 profils |
 | Micro-pauses entre séries | `LI_BURST_MIN`/`MAX`, `LI_BREAK_MIN_S`/`MAX_S` | pause 1 min 30–4 min toutes les 8–16 actions |
 | Plage horaire d'activité | `LI_ACTIVE_START`, `LI_ACTIVE_END`, `LI_TZ`, `LI_SKIP_WEEKEND` | 8h–20h, Europe/Paris |
 
 Les délais entre deux actions dépendent de la classe : envoi
 `LI_MIN_GAP_S`–`LI_MAX_GAP_S` (45–120 s), visite de profil
-`LI_VIEW_MIN_GAP_S`–`LI_VIEW_MAX_GAP_S` (20–60 s), lecture légère
+`LI_VIEW_MIN_GAP_S`–`LI_VIEW_MAX_GAP_S` (6–10 s, idem pour une page de
+recherche), lecture légère
 `LI_READ_MIN_GAP_S`–`LI_READ_MAX_GAP_S` (4–12 s).
 
-La **plage horaire ne s'applique qu'aux envois et aux visites de profil** :
+La **plage horaire ne s'applique qu'aux envois, aux visites de profil et aux
+recherches** :
 consulter sa messagerie le soir n'a rien d'anormal, enchaîner des visites de
 profil à 3 h du matin si. Mettre `LI_ACTIVE_START` et `LI_ACTIVE_END` à la même
 valeur désactive la plage.
@@ -115,6 +117,7 @@ Outils disponibles :
 | `linkedin_read_messages` | Lire l'historique d'une conversation avec un profil (`/in/...`) |
 | `linkedin_list_conversations` | Lister les conversations récentes de la messagerie |
 | `linkedin_view_profile` | Voir un ou plusieurs profils (`/in/...`) : nom, titre, à propos, expériences… |
+| `linkedin_search_people` | Rechercher des personnes (mots-clés, nom, poste, entreprise, école, niveau de relation) |
 | `linkedin_status` | Extension connectée ? quotas, file, pause, derniers résultats |
 | `linkedin_cancel` | Vider la file d'attente |
 
@@ -138,6 +141,19 @@ figurent dans `pending` — `linkedin_status` suit leur avancement.
 Les lectures ne consomment **pas** de quota journalier et n'ont
 qu'un petit délai (2–6 s) entre elles, mais restent séquentielles et
 déclenchent la pause de sécurité si LinkedIn affiche un captcha.
+
+**Recherche** : `linkedin_search_people` ouvre la recherche « Personnes » de
+LinkedIn dans la fenêtre de travail (la même que pour les profils) et rend une
+page de résultats : `{ page, total, has_next, results: [{ name, url, degree,
+headline, location, summary }] }` (10 profils max, champs vides omis).
+Critères combinables : `keywords` (texte libre, on peut y glisser une ville),
+`first_name`, `last_name`, `title`, `company`, `school` (champs texte du
+panneau « Tous les filtres »), `network` (`["1","2","3"]` = niveaux de
+relation) et `page`. Chaque page compte comme une recherche
+(`LI_CAP_SEARCH`, 30/jour) — LinkedIn plafonne en plus les recherches des
+comptes gratuits (« limite d'utilisation commerciale », remontée en erreur).
+Affinez les critères plutôt que de parcourir dix pages, puis passez les URL
+retenues à `linkedin_view_profile` en un seul appel.
 
 **URL inexistante (404)** : si la page cible n'existe pas (profil supprimé ou
 renommé, faute de frappe dans le slug), l'outil échoue immédiatement avec

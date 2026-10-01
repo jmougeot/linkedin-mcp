@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "LinkedIn MCP — Claude",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Exécute en douceur, dans votre propre session LinkedIn, les invitations/messages demandés par Claude via le serveur MCP local. La cadence (quotas, délais) est imposée par le serveur.",
   "permissions": ["storage", "alarms", "tabs", "scripting"],
   "host_permissions": [

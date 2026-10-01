@@ -562,6 +562,26 @@ function parseProfileText(raw) {
 }
 window.__liParseProfileText = parseProfileText; // exposé pour les tests hors navigateur
 
+// Selon la variante de design, la page défile par la FENÊTRE (ancien design)
+// ou par un CONTENEUR interne (nouveau design : body = hauteur de la fenêtre,
+// window.scrollBy sans effet). On repère le vrai élément défilable.
+function isScrollable(el) {
+  return (
+    !!el &&
+    el.clientHeight >= window.innerHeight * 0.5 &&
+    el.scrollHeight > el.clientHeight + 200 &&
+    (el === document.scrollingElement || /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY))
+  );
+}
+function findScroller() {
+  if (isScrollable(document.scrollingElement)) return document.scrollingElement;
+  let best = null;
+  for (const el of document.querySelectorAll("main, div")) {
+    if (isScrollable(el) && (!best || el.scrollHeight > best.scrollHeight)) best = el;
+  }
+  return best || document.scrollingElement;
+}
+
 async function doViewProfile() {
   // Diagnostic temporaire : langue/visibilité/session pour comprendre les
   // lectures incomplètes. À retirer une fois la fonctionnalité stabilisée.
@@ -602,23 +622,6 @@ async function doViewProfile() {
     const t = renderedText();
     return /\n(Experience|Expérience)\n/.test(t) && /\n(Education|Formation)\n/.test(t);
   };
-  // Selon la variante de design, la page défile par la FENÊTRE (ancien design)
-  // ou par un CONTENEUR interne (nouveau design : body = hauteur de la fenêtre,
-  // window.scrollBy sans effet). On repère le vrai élément défilable.
-  const isScrollable = (el) =>
-    !!el &&
-    el.clientHeight >= window.innerHeight * 0.5 &&
-    el.scrollHeight > el.clientHeight + 200 &&
-    (el === document.scrollingElement || /(auto|scroll|overlay)/.test(getComputedStyle(el).overflowY));
-  const findScroller = () => {
-    if (isScrollable(document.scrollingElement)) return document.scrollingElement;
-    let best = null;
-    for (const el of document.querySelectorAll("main, div")) {
-      if (isScrollable(el) && (!best || el.scrollHeight > best.scrollHeight)) best = el;
-    }
-    return best || document.scrollingElement;
-  };
-
   let stableBottom = 0;
   let maxY = 0;
   let scroller = findScroller();
@@ -744,6 +747,171 @@ async function doViewProfile() {
   return { ok: true, data: { profile } };
 }
 
+/**
+ * Lit une page de résultats de la recherche « Personnes » (le background a
+ * déjà navigué vers /search/results/people/?...). Lecture pure du DOM, aucun
+ * clic — la pagination passe par l'URL (paramètre page), pas par le bouton.
+ * Les classes CSS des cartes changent trop souvent : on part des liens /in/
+ * (le seul repère stable), on remonte à la carte, puis on lit son texte ligne
+ * par ligne (nom, niveau, titre, localisation, contexte).
+ * ⚠️ ZONE À MAINTENIR : libellés FR + EN ci-dessous.
+ */
+const RE_SEARCH_NOISE = /^(View .{1,80}['’]s? profile|Voir le profil (de |d['’]).{1,80}|Status is .{1,30}|Statut\s*:.{0,30}|Connect|Se connecter|Message|Follow|Suivre|Pending|En attente|Verified|Vérifié|[·•])$/i;
+const RE_SEARCH_DEGREE = /^(?:[·•]\s*)?(?:relation de )?(1st|2nd|3rd\+?|1er|2e|3e\+?)(?:\s+(?:degree connection|niveau))?$/i;
+const RE_NO_RESULTS = /no results found|aucun résultat/i;
+const RE_SEARCH_LIMIT = /commercial use limit|limite d['’]utilisation commerciale|monthly limit for profile searches|limite mensuelle de recherches/i;
+
+/** querySelectorAll qui traverse les shadow roots ouverts (cf. deepGetById). */
+function deepQueryAll(selector, root = document, depth = 0, out = []) {
+  if (!root || depth > 40) return out;
+  out.push(...root.querySelectorAll(selector));
+  for (const host of root.querySelectorAll("*")) {
+    if (host.shadowRoot) deepQueryAll(selector, host.shadowRoot, depth + 1, out);
+  }
+  return out;
+}
+
+/** Parent dans l'arbre composé : franchit la frontière d'un shadow root. */
+function composedParent(el) {
+  return el.parentElement || (el.parentNode instanceof ShadowRoot ? el.parentNode.host : null);
+}
+
+/** URL canonique du profil visé par un lien (/in/slug/), sans les paramètres
+ *  de suivi (?miniProfileUrn=…) ; null si le lien ne mène pas à un profil. */
+function profileHref(a) {
+  try {
+    const m = /^\/in\/([^/?#]+)/.exec(new URL(a.getAttribute("href"), location.origin).pathname);
+    return m ? `https://www.linkedin.com/in/${m[1]}/` : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Carte de résultat contenant le lien : l'élément de liste le plus proche
+ *  (structure historique), sinon le plus grand ancêtre qui ne parle QUE de ce
+ *  profil — le suivant engloberait la carte voisine. */
+function resultCard(a, scope) {
+  for (let el = a; el && el !== scope; el = composedParent(el)) {
+    if (el.tagName === "LI" || el.getAttribute("role") === "listitem") return el;
+  }
+  const own = profileHref(a);
+  let card = a;
+  for (let el = composedParent(a); el && el !== scope; el = composedParent(el)) {
+    if ((el.textContent || "").length > 3000) break;
+    if (deepQueryAll('a[href*="/in/"]', el).some((x) => profileHref(x) && profileHref(x) !== own)) break;
+    card = el;
+  }
+  return card;
+}
+
+/** Découpe le texte d'une carte en { name, degree, headline, location, summary }. */
+function parseSearchCard(card, links) {
+  const lines = readableText(card).split("\n").filter((l) => !RE_SEARCH_NOISE.test(l));
+  // Nom : texte du premier lien du profil qui en porte un (le lien de la photo
+  // n'a souvent que l'image). « Jean Dupont • 2e » → nom + niveau.
+  let name = null;
+  let degree = null;
+  for (const a of links) {
+    const first = readableText(a).split("\n").find((l) => !RE_SEARCH_NOISE.test(l));
+    if (!first) continue;
+    const m = /^(.*?)\s*[·•]\s*(1st|2nd|3rd\+?|1er|2e|3e\+?)$/i.exec(first);
+    name = m ? m[1] : first;
+    if (m) degree = m[2];
+    break;
+  }
+  const rest = [];
+  for (const l of lines) {
+    const deg = RE_SEARCH_DEGREE.exec(l);
+    if (deg) { degree = degree || deg[1]; continue; }
+    if (name && (l === name || l.startsWith(name + " ") || l.startsWith(name + "•"))) continue;
+    if (!name) { name = l; continue; } // carte sans texte de lien : 1re ligne = nom
+    rest.push(l);
+  }
+  const out = {
+    name,
+    degree,
+    headline: rest[0] || null,
+    location: rest[1] || null,
+    // poste actuel, relations en commun… : une ligne compacte, plafonnée
+    summary: rest.slice(2).join(" · ").slice(0, 300) || null,
+  };
+  for (const k of Object.keys(out)) if (out[k] == null) delete out[k];
+  return out;
+}
+
+async function doSearchPeople(page = 1) {
+  const scope = () => document.querySelector("main") || document.body;
+  const profileLinks = () => deepQueryAll('a[href*="/in/"]', scope()).filter(profileHref);
+  // « Aucun résultat » est testé AVANT les liens : une page vide peut proposer
+  // des suggestions de profils qu'on prendrait pour des résultats.
+  const ready = await waitFor(() => {
+    const t = readableText(scope()).slice(0, 3000);
+    if (RE_SEARCH_LIMIT.test(t)) return "limit";
+    if (RE_NO_RESULTS.test(t)) return "empty";
+    return profileLinks().length ? "results" : null;
+  }, 20000);
+  if (ready === "limit") {
+    return { ok: false, error: "LinkedIn signale la limite de recherches atteinte (limite d'utilisation commerciale) — reprendre plus tard" };
+  }
+  if (ready === "empty") return { ok: true, data: { page, total: 0, results: [] } };
+  if (!ready) {
+    const diag =
+      `readyState=${document.readyState}, title=« ${document.title} », main=${!!document.querySelector("main")}, ` +
+      `texte rendu=${readableText(scope()).length} caractères`;
+    return { ok: false, error: `résultats de recherche non rendus après 20 s (${diag})` };
+  }
+
+  // Les cartes du bas et la pagination ne se rendent qu'au défilement : on
+  // descend par paliers jusqu'à un bas de page stable (cf. doViewProfile —
+  // pas de behavior:"smooth", suspendu quand la fenêtre est cachée).
+  let scroller = findScroller();
+  let stableBottom = 0;
+  for (let i = 0; i < 12 && stableBottom < 2; i++) {
+    if (!scroller.isConnected) scroller = findScroller();
+    const before = scroller.scrollHeight;
+    scroller.scrollTop += Math.round(window.innerHeight * rand(0.6, 0.9));
+    await sleep(rand(300, 650));
+    const atBottom = scroller.scrollTop + scroller.clientHeight >= scroller.scrollHeight - 100;
+    stableBottom = atBottom && scroller.scrollHeight === before ? stableBottom + 1 : 0;
+  }
+  await sleep(rand(300, 700));
+
+  // Regroupe les liens par carte (photo + nom pointent vers le même profil) ;
+  // une carte = un résultat, dans l'ordre de la page.
+  const main = scope();
+  const cards = new Map(); // carte -> { url, links }
+  for (const a of profileLinks()) {
+    const card = resultCard(a, main);
+    const entry = cards.get(card);
+    if (!entry) cards.set(card, { url: profileHref(a), links: [a] });
+    else if (profileHref(a) === entry.url) entry.links.push(a);
+  }
+  const seen = new Set();
+  const results = [];
+  for (const [card, { url, links }] of cards) {
+    if (seen.has(url)) continue;
+    seen.add(url);
+    const r = parseSearchCard(card, links);
+    if (r.name) results.push({ ...r, url });
+  }
+
+  const head = readableText(main).split("\n").slice(0, 60);
+  const totalLine = head.find((l) => /^(?:about |environ )?[\d\s.,  ]*\d\s+(results?|résultats?)$/i.test(l));
+  const total = totalLine ? Number(totalLine.replace(/\D/g, "")) : null;
+  const pager = deepQueryAll("button", main).filter((b) =>
+    /^(next|suivant|previous|précédent)$/i.test(`${b.getAttribute("aria-label") || b.textContent || ""}`.trim())
+  );
+  const next = pager.find((b) => /^(next|suivant)$/i.test(`${b.getAttribute("aria-label") || b.textContent || ""}`.trim()));
+
+  if (!results.length) {
+    return { ok: false, error: `aucun résultat lisible (${profileLinks().length} liens de profil trouvés — sélecteurs à mettre à jour ?)` };
+  }
+  const data = { page, results: results.slice(0, 10) };
+  if (total != null) data.total = total;
+  if (pager.length) data.has_next = !!next && !next.disabled;
+  return { ok: true, data };
+}
+
 const norm = (s) => (s || "").trim().toLowerCase().replace(/\s+/g, " ");
 
 /**
@@ -849,7 +1017,8 @@ if (!window.__liMcpListenerRegistered) {
 
 function registerLiListener() {
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg && msg.type === "li-action") {
+  // « li-search » : type dédié aux recherches (cf. background.js, runAction).
+  if (msg && (msg.type === "li-action" || msg.type === "li-search")) {
     const { action } = msg;
     (async () => {
       try {
@@ -894,7 +1063,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           : action.type === "read_messages" ? await doReadMessages(action.limit, inThread)
           : action.type === "list_conversations" ? await doListConversations(action.limit)
           : action.type === "view_profile" ? await doViewProfile()
-          : await doInvite(action.body);
+          : action.type === "search_people" ? await doSearchPeople(action.page)
+          : action.type === "invite" ? await doInvite(action.body)
+          // jamais d'invitation par défaut : un type inconnu (version du serveur
+          // plus récente que l'extension) ne doit déclencher aucun geste
+          : { ok: false, error: `type d'action inconnu de l'extension : ${action.type} (recharger l'extension ?)` };
         sendResponse(r);
       } catch (e) {
         sendResponse({ ok: false, error: String(e && e.message ? e.message : e) });
