@@ -20,8 +20,9 @@ En deux mots :
 3. Régler l'extension locale (popup) : adresse `https://votre-domaine`, jeton `<TOKEN>`.
 
 Ensuite, dans Cowork : *« envoie un message LinkedIn à … »*, *« lis mes
-conversations »* — avec les mêmes garde-fous anti-ban (quotas, délais, pause)
-imposés par le serveur.
+conversations »*, *« cherche des CTO chez Doctolib »* — avec les mêmes
+garde-fous anti-ban (quotas, délais, micro-pauses, plage horaire) imposés par
+le serveur. Claude Code utilise le même connecteur (voir DEPLOY.md § 6).
 
 > L'alternative « tout natif » (demander à Cowork de cliquer lui-même dans
 > LinkedIn) reste possible sans rien installer, mais elle est lente, fragile et
